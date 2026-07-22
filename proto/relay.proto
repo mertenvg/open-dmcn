@@ -1,0 +1,384 @@
+syntax = "proto3";
+
+package dmcn.relay;
+
+import "message.proto";
+
+option go_package = "github.com/mertenvg/open-dmcn/dmcnpb;dmcnpb";
+
+// RelayRequest is the top-level request wrapper for relay protocol operations.
+// Sent over libp2p streams using length-prefixed protobuf encoding.
+message RelayRequest {
+  oneof request {
+    StoreRequest store = 1;
+    FetchInit fetch_init = 2;
+    FetchProof fetch_proof = 3;
+    AckRequest ack = 4;
+    PingRequest ping = 5;
+    // Durable mailbox op, sent after the FETCH challenge in place of FetchProof.
+    MailboxOp mailbox_op = 6;
+    // Chunked durable STORE: this frame carries everything but the body bytes,
+    // which follow as raw length-prefixed chunks (decouples message size from the
+    // per-frame cap, so >4 MB messages can be stored).
+    StoreInit store_init = 7;
+    // Onion-routed forward: one layer for this relay to peel and forward (or
+    // deliver). See whitepaper Section 15.4.
+    OnionForwardRequest onion_forward = 8;
+    // --- Fleet resolution ops — public, unauthenticated reads. ---
+    GetIdentityRequest get_identity = 19;       // resolve a signed IdentityRecord for an address
+    GetDARRequest get_dar = 20;                 // resolve a signed DomainAuthorityRecord for a domain
+    GetFleetRosterRequest get_fleet_roster = 21; // resolve this fleet's signed node roster
+    GetRemovalRequest get_removal = 22;         // resolve a signed AddressRemovalRecord (tombstone)
+    GetBlocklistRequest get_blocklist = 23;     // resolve a signed CredentialBlockList for a domain
+    PutRecordRequest put_record = 24;           // push a self-authenticating record into a fleet node's store (replication)
+    GetRelayDescriptorRequest get_relay_descriptor = 25; // resolve a relay's onion descriptor (peer-ID self-anchored)
+  }
+
+  // GRAVESTONE: arms 9-18 and 26 were the operator/product ops (stat, set_drain,
+  // request_mailbox, mailbox_handoff, accounts, mailbox_kv_inject, set_quota,
+  // set_access, get_access, clear_access, consume_send_inject), moved to the
+  // product-side /dmcn/operate/1.0.0 protocol in the open-core split. Do not reuse.
+  reserved 9 to 18, 26;
+  reserved "stat", "set_drain", "request_mailbox", "mailbox_handoff", "accounts",
+           "mailbox_kv_inject", "set_quota", "set_access", "get_access", "clear_access",
+           "consume_send_inject";
+}
+
+// RelayResponse is the top-level response wrapper for relay protocol operations.
+message RelayResponse {
+  oneof response {
+    StoreResponse store = 1;
+    FetchChallenge fetch_challenge = 2;
+    FetchResponse fetch = 3;
+    AckResponse ack = 4;
+    PingResponse ping = 5;
+    ErrorResponse error = 6;
+    MailboxListResponse mailbox_list = 7;
+    // A BODY response: this frame carries the body metadata, then the body bytes
+    // follow as raw length-prefixed chunks (so >4 MB bodies can be returned).
+    MailboxBodyHeader mailbox_body_header = 8;
+    MailboxDeleteResponse mailbox_delete = 9;
+    // Hop-by-hop ACK for an onion forward.
+    OnionForwardResponse onion_forward = 10;
+    // --- Fleet resolution op responses. ---
+    GetIdentityResponse get_identity = 28;
+    GetDARResponse get_dar = 29;
+    GetFleetRosterResponse get_fleet_roster = 30;
+    GetRemovalResponse get_removal = 31;
+    GetBlocklistResponse get_blocklist = 32;
+    PutRecordResponse put_record = 33;
+    GetRelayDescriptorResponse get_relay_descriptor = 34;
+  }
+
+  // GRAVESTONE: arms 11-27 were the filter/KV/operator response arms (moved to the
+  // product-side /dmcn/mailbox-ext and /dmcn/operate protocols in the open-core split);
+  // 35 was consume_send (removed pre-split); 36 was consume_send_inject. Do not reuse.
+  reserved 11 to 27, 35, 36;
+  reserved "mailbox_get_filter", "mailbox_put_filter", "stat", "set_drain",
+           "request_mailbox", "mailbox_handoff", "accounts", "mailbox_kv_put",
+           "mailbox_kv_get", "mailbox_kv_list", "mailbox_kv_delete", "mailbox_kv_inject",
+           "mailbox_kv_stat", "set_quota", "set_access", "get_access", "clear_access",
+           "consume_send_inject";
+}
+
+// OnionPacket is one encrypted onion layer as it travels the wire — sealed to the
+// current hop's X25519 key (see internal/core/onion SealLayer). The relay derives
+// the layer key from ephemeral_pub + its own X25519 private key.
+message OnionPacket {
+  uint32 version = 1;
+  bytes ephemeral_pub = 2;     // 32 bytes
+  bytes nonce = 3;             // 12 bytes
+  bytes tag = 4;               // 16 bytes
+  bytes encrypted_layer = 5;   // AES-256-GCM ciphertext of the OnionLayer
+}
+
+// OnionLayer is the decrypted content of one hop's layer: where to send next and
+// what to send. Exactly one of inner / delivery is set.
+message OnionLayer {
+  string next_hop = 1;         // next relay's peer ID, or "DELIVER" at the last hop
+  int64 ttl_unix = 2;          // absolute expiry; a relay drops an expired packet
+  OnionPacket inner = 3;       // the next hop's packet (when forwarding)
+  bytes delivery = 4;          // a marshaled StoreRequest (when next_hop == "DELIVER")
+}
+
+// OnionForwardRequest carries one onion packet for this relay to peel.
+message OnionForwardRequest {
+  OnionPacket packet = 1;
+}
+
+// OnionForwardResponse is the hop-by-hop ACK: accepted means the layer was peeled
+// and forwarded/delivered (or already seen — idempotent).
+message OnionForwardResponse {
+  bool accepted = 1;
+}
+
+// StoreRequest asks the relay to store an encrypted envelope for a recipient.
+// The sender must be resolvable via the fleet registry.
+message StoreRequest {
+  string sender_address = 1;
+  bytes sender_signature = 2;                // Ed25519 signature over envelope hash
+  dmcn.message.EncryptedEnvelope envelope = 3;
+}
+
+// StoreResponse confirms successful storage.
+message StoreResponse {
+  bytes envelope_hash = 1;   // SHA-256 of serialized EncryptedEnvelope
+}
+
+// FetchInit begins the FETCH authentication flow.
+message FetchInit {
+  string address = 1;
+}
+
+// FetchChallenge is sent by the server with a random nonce for the client to sign.
+message FetchChallenge {
+  bytes nonce = 1;   // 32 bytes random challenge
+}
+
+// FetchProof provides the signed challenge nonce to authenticate the recipient.
+message FetchProof {
+  string address = 1;
+  bytes nonce = 2;
+  bytes signature = 3;   // Ed25519 signature over nonce
+}
+
+// FetchResponse returns pending envelopes for the authenticated recipient.
+message FetchResponse {
+  repeated dmcn.message.EncryptedEnvelope envelopes = 1;
+  repeated bytes envelope_hashes = 2;  // SHA-256 hashes corresponding to each envelope
+}
+
+// AckRequest confirms successful decryption of an envelope.
+message AckRequest {
+  bytes envelope_hash = 1;   // SHA-256 of the envelope being acknowledged
+}
+
+// AckResponse confirms the ACK was processed.
+message AckResponse {
+  bool success = 1;
+}
+
+// PingRequest is a liveness check.
+message PingRequest {}
+
+// PingResponse returns relay node metadata.
+message PingResponse {
+  string version = 1;
+  int64 uptime_seconds = 2;
+  uint32 stored_envelopes = 3;
+}
+
+// --- Fleet resolution ops ---
+//
+// Public, unauthenticated reads served by a fleet node for the domains it is
+// authoritative for. Each returns a self-authenticating signed record as marshaled
+// protobuf (`record`); the CALLER verifies it against the domain's DNS-anchored
+// fingerprint. The fleet serving it is untrusted transport — a wrong/lying fleet is
+// DoS-only, never a forgery vector.
+
+// GetIdentityRequest resolves the signed IdentityRecord for an address.
+message GetIdentityRequest {
+  string address = 1;
+}
+message GetIdentityResponse {
+  bool found = 1;
+  bytes record = 2;   // marshaled dmcn.identity.IdentityRecord (empty when not found)
+}
+
+// GetDARRequest resolves the signed DomainAuthorityRecord for a domain.
+message GetDARRequest {
+  string domain = 1;
+}
+message GetDARResponse {
+  bool found = 1;
+  bytes record = 2;   // marshaled dmcn.identity.DomainAuthorityRecord
+}
+
+// GetFleetRosterRequest resolves a fleet's signed node roster (usually the served node's own).
+message GetFleetRosterRequest {
+  string fleet_domain = 1;
+}
+message GetFleetRosterResponse {
+  bool found = 1;
+  bytes record = 2;   // marshaled dmcn.identity.FleetRoster
+}
+
+// GetRemovalRequest resolves the signed AddressRemovalRecord (tombstone) for an address.
+message GetRemovalRequest {
+  string address = 1;
+}
+message GetRemovalResponse {
+  bool found = 1;
+  bytes record = 2;   // marshaled dmcn.identity.AddressRemovalRecord
+}
+
+// GetBlocklistRequest resolves the signed CredentialBlockList for a domain.
+message GetBlocklistRequest {
+  string domain = 1;
+}
+message GetBlocklistResponse {
+  bool found = 1;
+  bytes record = 2;   // marshaled dmcn.identity.CredentialBlockList
+}
+
+// RecordKind identifies which self-authenticating record a PutRecord carries.
+enum RecordKind {
+  RECORD_KIND_UNSPECIFIED = 0;
+  RECORD_KIND_IDENTITY = 1;   // dmcn.identity.IdentityRecord
+  RECORD_KIND_DAR = 2;        // dmcn.identity.DomainAuthorityRecord
+  RECORD_KIND_ROSTER = 3;     // dmcn.identity.FleetRoster
+  RECORD_KIND_REMOVAL = 4;    // dmcn.identity.AddressRemovalRecord
+  RECORD_KIND_BLOCKLIST = 5;  // dmcn.identity.CredentialBlockList
+}
+
+// PutRecordRequest pushes one self-authenticating record into the recipient node's RecordStore —
+// the fleet-replication path that replaces DHT writes. The receiving relay RE-VERIFIES the record
+// (self-signature; DNS fingerprint anchor for a DAR; monotonic-revision anti-rollback) before
+// storing, so a compromised pusher cannot inject a forgery. Identity-record pushes are additionally
+// gated on the caller's 'routing' fleet grant for the record's domain (anti-spam); DAR/roster/
+// removal/blocklist are self-anchoring (DNS/root-signed), so their signature is the authority.
+message PutRecordRequest {
+  RecordKind kind = 1;
+  bytes record = 2;   // marshaled record of the given kind
+}
+message PutRecordResponse {
+  bool accepted = 1;
+  string reason = 2;  // populated when not accepted
+}
+
+// GetRelayDescriptorRequest resolves a relay node's onion descriptor by peer ID (the fleet-served
+// replacement for the DHT relay-descriptor lookup). The descriptor is self-anchored — signed by the
+// node's libp2p key, recoverable from the peer ID — so the reader verifies it without trusting the
+// server. Typically asked of the descriptor's own node.
+message GetRelayDescriptorRequest {
+  string peer_id = 1;
+}
+message GetRelayDescriptorResponse {
+  bool found = 1;
+  bytes record = 2;   // marshaled dmcn.identity.RelayDescriptor
+}
+
+// ErrorResponse is returned when an operation fails.
+message ErrorResponse {
+  string code = 1;
+  string message = 2;
+}
+
+// PeersRequest queries a node for its cluster peers.
+message PeersRequest {}
+
+// PeersResponse returns the list of peer multiaddrs in the cluster.
+message PeersResponse {
+  repeated string peers = 1;
+}
+
+// MailboxEntry is the small, listable header view of a stored message. The
+// mailbox persists one per message and serves it in FETCH-LIST without ever
+// reading the (large) body. Carries everything a client needs to unwrap the CEK
+// and render an inbox row: the wrapped CEKs plus the encrypted header.
+message MailboxEntry {
+  bytes hash = 1;                                        // envelope hash (message id within a mailbox)
+  int64 stored_at = 2;                                   // Unix seconds the mailbox accepted it
+  uint64 body_size = 3;                                  // stored body size in bytes (ciphertext), for UI/quota
+  repeated dmcn.message.RecipientRecord recipients = 4;  // wrapped CEKs (per device)
+  bytes encrypted_header = 5;                            // AES-256-GCM ciphertext of SignedHeader
+  bytes header_nonce = 6;                                // 12 bytes
+  bytes header_tag = 7;                                  // 16 bytes
+  uint32 header_size_class = 8;                          // padded size bucket
+  bytes body_content_address = 9;                        // CIDv1(raw/sha2-256) of the body blob; the durable pointer future dedup keys on
+}
+
+// MailboxBody is the stored body of a message, fetched by hash on open. The
+// client already holds the CEK (unwrapped from the MailboxEntry), so the body
+// entry needs no recipient records.
+message MailboxBody {
+  bytes encrypted_body = 1;     // AES-256-GCM ciphertext of MessageContent
+  bytes body_nonce = 2;         // 12 bytes
+  bytes body_tag = 3;           // 16 bytes
+  uint32 body_size_class = 4;   // padded size bucket
+  bytes body_content_address = 5; // CIDv1(raw/sha2-256) of body_nonce||encrypted_body||body_tag (self-describing blob)
+}
+
+// MailboxOp is a durable mailbox operation, sent on a FETCH-authenticated stream
+// (FetchInit -> FetchChallenge -> MailboxOp) in place of FetchProof. The nonce +
+// signature prove the caller controls the recipient identity, exactly like FETCH.
+message MailboxOp {
+  bytes nonce = 1;          // echoed challenge nonce
+  bytes signature = 2;      // Ed25519 over nonce
+  oneof op {
+    MailboxListOp list = 3;
+    MailboxBodyOp body = 4;
+    MailboxDeleteOp delete = 5;
+  }
+
+  // GRAVESTONE: fields 6-12 were the mail-filter and personal-KV ops (get_filter,
+  // put_filter, kv_put, kv_get, kv_list, kv_delete, kv_stat), moved to the product-side
+  // /dmcn/mailbox-ext/1.0.0 protocol in the open-core split; 13 was a consume_send
+  // variant removed earlier. Do not reuse.
+  reserved 6 to 13;
+  reserved "get_filter", "put_filter", "kv_put", "kv_get", "kv_list", "kv_delete", "kv_stat";
+}
+
+// MailboxListOp requests a page of header previews (non-consuming).
+message MailboxListOp {
+  uint32 limit = 1;     // 0 = server default
+  bytes cursor = 2;     // empty = from the beginning; else a prior next_cursor
+}
+
+// MailboxBodyOp requests the body of one message, fetched on open.
+message MailboxBodyOp {
+  bytes hash = 1;
+}
+
+// MailboxDeleteOp removes one message (the explicit, user-driven action).
+message MailboxDeleteOp {
+  bytes hash = 1;
+}
+
+// MailboxListResponse is a page of header previews plus a continuation cursor
+// (empty when the mailbox has been fully drained).
+message MailboxListResponse {
+  repeated MailboxEntry entries = 1;
+  bytes next_cursor = 2;
+}
+
+// MailboxBodyHeader precedes the streamed body chunks of a BODY response. The
+// client already holds the CEK (from the LIST entry), so only the body's nonce,
+// tag, size class and total length are needed to decrypt the reassembled bytes.
+message MailboxBodyHeader {
+  bytes body_nonce = 1;          // 12 bytes
+  bytes body_tag = 2;            // 16 bytes
+  uint32 body_size_class = 3;    // padded size bucket
+  uint64 body_total_size = 4;    // bytes of encrypted_body that follow as chunks
+}
+
+// MailboxDeleteResponse confirms a delete.
+message MailboxDeleteResponse {
+  bool success = 1;
+}
+
+// StoreInit begins a chunked durable STORE. It carries the full envelope minus
+// the body bytes (which stream after it as raw length-prefixed chunks), plus the
+// sender's signature over the full envelope hash for spam control.
+message StoreInit {
+  string sender_address = 1;
+  bytes sender_signature = 2;                            // Ed25519 over the full envelope hash
+  uint32 version = 3;
+  bytes message_id = 4;                                  // 16 bytes
+  int64 created_at = 5;                                  // Unix seconds
+  repeated dmcn.message.RecipientRecord recipients = 6;
+  bytes encrypted_header = 7;
+  bytes header_nonce = 8;
+  bytes header_tag = 9;
+  uint32 header_size_class = 10;
+  bytes body_nonce = 11;
+  bytes body_tag = 12;
+  uint32 body_size_class = 13;
+  uint64 body_total_size = 14;                           // bytes of encrypted_body that follow as chunks
+  bytes body_content_address = 16;                       // cleartext body content address; required so the reassembled envelope hash matches the sender signature
+
+  // GRAVESTONE: field 15 was handoff (relay→relay drain-handoff mode), moved to the
+  // product-side /dmcn/operate/1.0.0 protocol in the open-core split. Do not reuse.
+  reserved 15;
+  reserved "handoff";
+}

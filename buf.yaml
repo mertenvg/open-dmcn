@@ -1,0 +1,27 @@
+version: v2
+# The canonical schema of the open DMCN core protocol: identity, message,
+# relay (mail interop), and bridge (an optional SMTP-interop capability).
+# Product/operator extensions (the /dmcn/operate and /dmcn/mailbox-ext
+# protocols, fleet permits, provisioning, rate schedules) live in the product
+# repository's proto/ext and are NOT part of this schema.
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  # The proto layout predates buf's directory/package conventions: packages
+  # live flat and are unversioned (dmcn.identity, not dmcn/identity/v1).
+  # Restructuring would rename every generated import and every fully-qualified
+  # type name reflection-based consumers load, for no wire-format benefit — so
+  # the structural naming rules are excepted deliberately.
+  except:
+    - DIRECTORY_SAME_PACKAGE
+    - PACKAGE_DIRECTORY_MATCH
+    - PACKAGE_VERSION_SUFFIX
+    - ENUM_ZERO_VALUE_SUFFIX
+breaking:
+  # The core schema is the compatibility contract of the open protocol:
+  # PACKAGE-level checks compare package contents regardless of which file
+  # declares them. Vacated numbers are reserved with gravestones — never reuse.
+  use:
+    - PACKAGE

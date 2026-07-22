@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package dmcn.bridge;
+
+option go_package = "github.com/mertenvg/open-dmcn/dmcnpb;dmcnpb";
+
+// BridgeTrustTier represents the trust classification assigned to an
+// inbound legacy email message by the bridge node.
+// See whitepaper Section 15.6.2.
+enum BridgeTrustTier {
+  BRIDGE_TRUST_TIER_UNSPECIFIED = 0;
+  BRIDGE_TRUST_TIER_VERIFIED_LEGACY = 1;
+  BRIDGE_TRUST_TIER_UNVERIFIED_LEGACY = 2;
+  BRIDGE_TRUST_TIER_SUSPICIOUS = 3;
+}
+
+// SPFResult represents the outcome of an SPF check on inbound email.
+enum SPFResult {
+  SPF_RESULT_UNSPECIFIED = 0;
+  SPF_RESULT_PASS = 1;
+  SPF_RESULT_FAIL = 2;
+  SPF_RESULT_SOFTFAIL = 3;
+  SPF_RESULT_NEUTRAL = 4;
+}
+
+// DKIMResult represents the outcome of a DKIM check on inbound email.
+enum DKIMResult {
+  DKIM_RESULT_UNSPECIFIED = 0;
+  DKIM_RESULT_PASS = 1;
+  DKIM_RESULT_FAIL = 2;
+}
+
+// DMARCResult represents the outcome of a DMARC check on inbound email.
+enum DMARCResult {
+  DMARC_RESULT_UNSPECIFIED = 0;
+  DMARC_RESULT_PASS = 1;
+  DMARC_RESULT_FAIL = 2;
+}
+
+// BridgeClassificationRecord is a signed attestation by a bridge node
+// describing the authentication outcome of an inbound legacy email.
+// See whitepaper Section 15.6.2.
+message BridgeClassificationRecord {
+  string bridge_address = 1;       // DMCN address of the bridge operator
+  bytes bridge_public_key = 2;     // 32 bytes Ed25519 public key
+  string smtp_from = 3;            // original SMTP From address
+  string smtp_sender_ip = 4;       // sending server IP address
+  SPFResult spf_result = 5;
+  DKIMResult dkim_result = 6;
+  DMARCResult dmarc_result = 7;
+  int32 reputation_score = 8;      // -100 to +100; 0 = neutral
+  BridgeTrustTier trust_tier = 9;
+  int64 classified_at = 10;        // Unix seconds
+  bytes bridge_signature = 11;     // 64 bytes Ed25519 sig over all preceding fields
+}
+
+// BridgeDeliveryReceipt is a signed receipt from the bridge confirming
+// outbound SMTP delivery of a DMCN message.
+message BridgeDeliveryReceipt {
+  bytes original_message_id = 1;   // 16 bytes UUID of the original message
+  string recipient_email = 2;      // legacy email address delivered to
+  string bridge_address = 3;       // DMCN address of the bridge operator
+  int64 delivered_at = 4;          // Unix seconds
+  bool success = 5;
+  string error_detail = 6;         // empty on success
+  bytes bridge_signature = 7;      // 64 bytes Ed25519 sig over all preceding fields
+}

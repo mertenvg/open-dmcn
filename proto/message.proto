@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package dmcn.message;
+
+option go_package = "github.com/mertenvg/open-dmcn/dmcnpb;dmcnpb";
+
+// MessageBody holds the content of a message.
+// See whitepaper Section 15.3.1.
+message MessageBody {
+  string content_type = 1;   // MIME type, e.g. "text/plain"
+  bytes content = 2;         // UTF-8 encoded body text
+}
+
+// AttachmentRecord describes an attachment within a message.
+// See whitepaper Section 15.3.1.
+message AttachmentRecord {
+  bytes attachment_id = 1;   // 16 bytes UUID
+  string filename = 2;
+  string content_type = 3;   // MIME type
+  uint64 size_bytes = 4;
+  bytes content_hash = 5;    // 32 bytes SHA-256 of plaintext content
+  bytes content = 6;         // attachment content (encrypted separately)
+}
+
+// PlaintextMessage represents a composed message before signing or encryption.
+// See whitepaper Section 15.3.1.
+message PlaintextMessage {
+  uint32 version = 1;
+  bytes message_id = 2;            // 16 bytes UUID
+  bytes thread_id = 3;             // 16 bytes UUID
+  string sender_address = 4;
+  bytes sender_public_key = 5;     // 32 bytes Ed25519
+  string recipient_address = 6;
+  int64 sent_at = 7;               // Unix seconds
+  string subject = 8;
+  MessageBody body = 9;
+  repeated AttachmentRecord attachments = 10;
+  bytes reply_to_id = 11;          // 16 bytes UUID; empty = not a reply
+}
+
+// SignedMessage wraps a PlaintextMessage with the sender's Ed25519 signature.
+// See whitepaper Section 15.3.2.
+message SignedMessage {
+  PlaintextMessage plaintext = 1;
+  bytes sender_signature = 2;     // 64 bytes Ed25519 sig over canonical serialization of plaintext
+}
+
+// MessageHeader is the small, previewable part of a message — who/what/when plus
+// a commitment (body_hash) to the body. Encrypted and signed independently of the
+// body so a recipient can preview their inbox (LIST) and trust it without
+// downloading the (potentially large) body.
+message MessageHeader {
+  uint32 version = 1;
+  bytes message_id = 2;            // 16 bytes UUID
+  bytes thread_id = 3;             // 16 bytes UUID
+  string sender_address = 4;
+  bytes sender_public_key = 5;     // 32 bytes Ed25519
+  // Per-envelope routing/primary recipient of THIS copy (a single address).
+  // Distinct from the `to` list below: `recipient_address` labels who this
+  // particular envelope copy was addressed to (recipient copy = that recipient;
+  // Sent self-copy = the sender's own address), while `to`/`cc` carry the full
+  // shared audience visible to everyone.
+  string recipient_address = 6;
+  int64 sent_at = 7;               // Unix seconds
+  string subject = 8;
+  uint32 attachment_count = 9;
+  uint64 body_size = 10;           // plaintext body size, for UI
+  string snippet = 11;             // optional short preview of the body
+  bytes reply_to_id = 12;          // 16 bytes UUID; empty = not a reply
+  bytes body_hash = 13;            // 32 bytes SHA-256 over canonical MessageContent
+  // Content address of the body ciphertext blob (body_nonce||encrypted_body||body_tag):
+  // CIDv1(raw, sha2-256), 36 bytes. Signed (covered by the header signature), so a
+  // verified header commits to the exact ciphertext blob, keylessly. Empty pre-feature.
+  bytes body_content_address = 14;
+  // Full recipient lists, signature-protected and visible to every recipient of
+  // this envelope. `to`/`cc` are identical across all recipients' copies. `bcc` is
+  // only populated on the sender's own "Sent" self-copy; every recipient copy (To,
+  // Cc, and Bcc recipients alike) carries an EMPTY bcc, so a Bcc recipient is never
+  // revealed. Empty repeated fields are omitted by deterministic marshaling, so a
+  // recipient copy with no bcc is byte-identical to one that never set it.
+  repeated string to = 15;
+  repeated string cc = 16;
+  repeated string bcc = 17;
+}
+
+// SignedHeader wraps a MessageHeader with the sender's signature (covers body_hash,
+// so verifying the header authenticates the eventual body too).
+message SignedHeader {
+  MessageHeader header = 1;
+  bytes sender_signature = 2;      // 64 bytes Ed25519 over canonical MessageHeader
+}
+
+// MessageContent is the large part: body + attachments. Verified against
+// MessageHeader.body_hash when fetched.
+message MessageContent {
+  MessageBody body = 1;
+  repeated AttachmentRecord attachments = 2;
+}
+
+// RecipientRecord holds the wrapped CEK for a single recipient device.
+// See whitepaper Section 15.3.3.
+message RecipientRecord {
+  bytes device_id = 1;            // 16 bytes UUID
+  bytes recipient_x_pub = 2;     // 32 bytes X25519 public key of recipient
+  bytes ephemeral_x_pub = 3;     // 32 bytes per-recipient ephemeral X25519 public key
+  bytes wrapped_cek = 4;          // AES-256-GCM ciphertext of CEK
+  bytes cek_nonce = 5;            // 12 bytes nonce for CEK wrapping
+  bytes cek_tag = 6;              // 16 bytes GCM auth tag for CEK wrapping
+}
+
+// EncryptedEnvelope is the outer transport structure for encrypted messages.
+// See whitepaper Section 15.3.3.
+message EncryptedEnvelope {
+  uint32 version = 1;
+  bytes message_id = 2;                   // 16 bytes UUID
+  repeated RecipientRecord recipients = 3;
+  bytes encrypted_payload = 4;            // AES-256-GCM ciphertext of SignedMessage
+  bytes payload_nonce = 5;                // 12 bytes nonce for payload encryption
+  bytes payload_tag = 6;                  // 16 bytes GCM auth tag for payload
+  uint32 payload_size_class = 7;          // padded size bucket
+  int64 created_at = 8;                   // Unix seconds
+  bytes ratchet_pub_key = 9;              // 32 bytes; zero in protocol v1
+
+  // Split header/body format (additive). When encrypted_header is non-empty the
+  // envelope carries a separable, independently-fetchable header and body, both
+  // sealed with the same per-message CEK, instead of a single encrypted_payload.
+  bytes encrypted_header = 10;            // AES-256-GCM ciphertext of SignedHeader
+  bytes header_nonce = 11;                // 12 bytes
+  bytes header_tag = 12;                  // 16 bytes
+  uint32 header_size_class = 13;          // padded size bucket
+  bytes encrypted_body = 14;              // AES-256-GCM ciphertext of MessageContent
+  bytes body_nonce = 15;                  // 12 bytes
+  bytes body_tag = 16;                    // 16 bytes
+  uint32 body_size_class = 17;            // padded size bucket
+
+  // Cleartext copy of the body's content address (CIDv1 raw/sha2-256) so relays can
+  // verify integrity and (later) key storage on it WITHOUT the CEK. The authoritative
+  // copy is the signed one inside encrypted_header (MessageHeader.body_content_address);
+  // this one is an unauthenticated routing/dedup hint. Empty pre-feature.
+  bytes body_content_address = 18;
+}

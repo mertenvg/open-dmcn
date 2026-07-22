@@ -1,0 +1,344 @@
+syntax = "proto3";
+
+package dmcn.identity;
+
+option go_package = "github.com/mertenvg/open-dmcn/dmcnpb;dmcnpb";
+
+// VerificationTier represents the level of identity verification.
+// See whitepaper Section 15.2.2.
+// Only DOMAIN_DNS and DANE are valid for registered addresses; provider-hosted
+// address claiming is not supported (see Section 12 for rationale).
+enum VerificationTier {
+  VERIFICATION_TIER_UNVERIFIED  = 0;
+  reserved 1;
+  reserved "VERIFICATION_TIER_PROVIDER_HOSTED";
+  VERIFICATION_TIER_DOMAIN_DNS  = 2;
+  VERIFICATION_TIER_DANE        = 3;
+}
+
+// AttestationType represents the method of attestation.
+// See whitepaper Section 15.2.3.
+enum AttestationType {
+  ATTESTATION_TYPE_UNSPECIFIED = 0;
+  ATTESTATION_TYPE_IN_PERSON = 1;
+  ATTESTATION_TYPE_FINGERPRINT = 2;
+  ATTESTATION_TYPE_NETWORK = 3;
+  ATTESTATION_TYPE_ORGANISATIONAL = 4;
+}
+
+// AttestationRecord represents a web-of-trust attestation.
+// See whitepaper Section 15.2.3.
+message AttestationRecord {
+  string attester_address = 1;
+  bytes attester_pubkey = 2;    // 32 bytes Ed25519
+  string subject_address = 3;
+  bytes subject_pubkey = 4;     // 32 bytes Ed25519
+  AttestationType attestation_type = 5;
+  int64 attested_at = 6;        // Unix seconds
+  int64 expires_at = 7;         // Unix seconds; 0 = no expiry
+  bytes signature = 8;          // 64 bytes Ed25519 sig over all preceding fields
+}
+
+// IdentityRecord is a self-certifying identity binding.
+// See whitepaper Section 15.2.2.
+message IdentityRecord {
+  uint32 version = 1;
+  string address = 2;                    // local@domain
+  bytes ed25519_public_key = 3;          // 32 bytes
+  bytes x25519_public_key = 4;           // 32 bytes
+  int64 created_at = 5;                  // Unix seconds
+  int64 expires_at = 6;                  // Unix seconds; 0 = no expiry
+  repeated string relay_hints = 7;
+  VerificationTier verification_tier = 8;
+  repeated AttestationRecord attestations = 9;
+  bytes self_signature = 10;             // 64 bytes Ed25519 sig over all preceding fields
+
+  // Reserved for future verifiable claims / SSI extension (protocol v2+)
+  // Fields 11–15: claims, claim_record
+  reserved 11, 12, 13, 14, 15;
+  reserved "claims", "claim_records";
+
+  // Reserved for future identity policy flags (protocol v2+)
+  // Fields 16–18: policy, policy_flags, guardian_policy
+  reserved 16, 17, 18;
+  reserved "policy", "policy_flags", "guardian_policy";
+
+  // Bridge capability flag — true if this identity operates as a bridge node.
+  // See whitepaper Section 15.6.
+  bool bridge_capability = 19;
+
+  // Domain Authority countersignature (whitepaper Section 13.2). Present when a
+  // domain authority — directly, or via a delegated sub-authority — vouches for
+  // this address↔keys binding. Excluded from the self-signature: the authority
+  // signs after the user self-signs.
+  bytes domain_countersignature = 20;       // 64 bytes Ed25519 over the binding
+  int64 domain_countersigned_at = 21;       // Unix seconds; authenticated time of countersigning
+  bytes domain_countersigner_pubkey = 22;   // 32 bytes Ed25519 of the root or sub-authority signer
+
+  // require_onion: the mailbox owner requires inbound mail to arrive via onion
+  // routing (senders use onion; the recipient's relay rejects direct STOREs).
+  // Covered by the self-signature. See whitepaper Section 15.4.
+  bool require_onion = 23;
+
+  // address_credential (Credential PKI): the domain's attestation of this address↔key
+  // binding (role "address"), replacing the domain_countersignature fields. The user
+  // self-signature above still binds the keys; the credential is the domain's
+  // signature, issued AFTER (so excluded from the self-signature). Preferred over the
+  // legacy countersignature when present.
+  Credential address_credential = 24;
+
+  // routing_credential (Credential PKI): the OPERATOR's attestation of this address's
+  // mailbox routing (role "routing", carrying the authoritative relay_hints). RelayHints
+  // is operational, not identity — it is OWNED BY THE OPERATOR, excluded from the owner
+  // self-signature (field 7 above is a reader-facing mirror), and signed here by the
+  // domain authority/sub-authority. This lets an operator re-point/rebalance routing
+  // without the mailbox owner's key. The credential's relay_hints are authoritative.
+  Credential routing_credential = 25;
+
+  // revision is the owner-signed monotonic version of the identity core, bumped on every
+  // owner re-sign (key rotation, expiry refresh). Covered by the self-signature, so only the
+  // owner can advance it. Fleet PutRecord + the resolver use it for anti-rollback: a record
+  // with a lower revision cannot overwrite a higher one (routing-credential-only updates,
+  // which don't touch the owner core, tiebreak on the routing credential's issued_at).
+  uint64 revision = 26;
+
+  // GRAVESTONE: field 27 was rate_credential (an operator send-rate Credential), removed in
+  // the open-core split. Operator-attached credentials beyond routing now travel in
+  // operator_credentials (28); the send-rate schedule specifically rides an extension
+  // attribute on such a credential (see Credential.attributes). Do not reuse 27.
+  reserved 27;
+  reserved "rate_credential";
+
+  // operator_credentials: OPERATOR-attached credentials beyond routing — the generic
+  // extension point for operator-owned, per-account attestations (semantics identified by
+  // each credential's roles/attributes). Excluded from the owner self-signature exactly like
+  // fields 24/25: issued and re-issued without the owner's key. Same-revision anti-rollback
+  // tiebreak: the newest issued_at across routing_credential AND operator_credentials wins.
+  repeated Credential operator_credentials = 28;
+}
+
+// AuthorityKey is one entry in a domain root authority's key timeline.
+// effective_from-only: a key is effective from effective_from until the next
+// key's effective_from; the latest key is open-ended (whitepaper Section 13.1).
+message AuthorityKey {
+  bytes ed25519_public_key = 1;  // 32 bytes
+  bytes x25519_public_key = 2;   // 32 bytes
+  int64 effective_from = 3;      // Unix seconds
+  uint32 rotation_reason = 4;    // carried-unenforced; for the future revocation phase
+}
+
+// SubAuthority is a key the domain root delegates countersigning to
+// (whitepaper Section 13.6). Covered by the DAR self-signature. Retired by
+// setting effective_until; the entry is kept so earlier countersigs stay valid.
+message SubAuthority {
+  bytes ed25519_public_key = 1;  // 32 bytes
+  string scope = 2;              // "" = whole domain
+  int64 effective_from = 3;      // Unix seconds
+  int64 effective_until = 4;     // Unix seconds; 0 = open-ended
+  uint32 permissions = 5;        // carried-unenforced
+}
+
+// DomainAuthorityRecord declares a domain's authority key (DNS-proven) and the
+// keys it authorizes to countersign addresses under the domain. Served by the
+// domain's fleet and verified against the domain's DNS fingerprint anchor.
+message DomainAuthorityRecord {
+  uint32 version = 1;
+  string domain = 2;
+  bytes authority_ed25519_public_key = 3;   // 32 bytes — CURRENT root key
+  bytes authority_x25519_public_key = 4;    // 32 bytes — CURRENT root key
+  int64 authority_effective_from = 5;       // Unix seconds — current key's start
+  repeated AuthorityKey superseded_keys = 6; // root rotation history
+  repeated SubAuthority sub_authorities = 7; // delegated signers (append-only)
+  uint32 policy_flags = 8;                   // carried-unenforced
+  int64 created_at = 9;                      // Unix seconds
+  uint64 revision = 10;                      // monotonic; bumped on every republish
+  bytes self_signature = 11;                 // 64 bytes Ed25519 by CURRENT root key over fields 1-10,12-14
+  // Unified Credential PKI: the domain's authority credentials (role "sub-authority",
+  // any delegation depth) live here so one cached DAR fetch resolves any issuer. Each
+  // is independently root/authority-signed; also covered by the DAR self-signature.
+  repeated Credential authority_credentials = 12;
+  // Local-parts (case-insensitive) that may NOT be self-service registered on this domain —
+  // seeded with a default set at genesis, then fully owner-customizable. A reserved address
+  // requires the domain authority's countersignature to become usable. Covered by the DAR
+  // self-signature. See whitepaper Section 13.
+  repeated string reserved_local_parts = 13;
+  // fleet_domain: the fleet domain this mailbox domain defers hosting to (email's MX
+  // delegation). Empty ⇒ the domain hosts its own nodes. This is the SIGNED mirror of the
+  // DNS "fleet=" pointer (deferral hardening): a resolver enforces DNS fleet== this value,
+  // fail-closed on mismatch, so the authorized fleet is cryptographically confirmed by the
+  // domain's own root key, not merely DNS-asserted. Covered by the DAR self-signature.
+  string fleet_domain = 14;
+}
+
+// FleetNode is one node/relay in a fleet roster: its peer ID, where to dial it, and
+// (informationally) what roles it serves. The node still proves its own membership
+// Credential at /dmcn/join; the roster only advertises where to find it.
+message FleetNode {
+  string peer_id = 1;
+  repeated string multiaddrs = 2;
+  repeated string roles = 3;     // node|bridge|... (informational)
+}
+
+// FleetRoster is the fleet OWNER's root-signed, monotonic-revision list of the nodes
+// that serve the fleet, anchored to the fleet domain's DNS fingerprint (its own DAR root
+// key). It is the availability/discovery layer that replaces the DHT's provider records:
+// a reader bootstraps from a few DNS "seed=" endpoints, fetches this roster from any of
+// them, and learns the full authoritative node set (so discovery is not single-pinned).
+// The roster's signature only vouches for "these nodes serve this fleet" — identity
+// records and DARs remain trust-anchored to each mailbox domain, so a lying roster is an
+// availability concern, never a forgery vector.
+message FleetRoster {
+  uint32 version = 1;
+  string fleet_domain = 2;       // the fleet domain whose root key signs this (its FP anchors it in DNS)
+  repeated FleetNode nodes = 3;
+  uint64 revision = 4;           // monotonic; bumped on every republish
+  int64 created_at = 5;          // Unix seconds; selects the root key that signed it
+  bytes self_signature = 6;      // 64 bytes Ed25519 by the fleet domain root key over fields 1-5
+}
+
+// Credential is the unified DMCN membership credential. An authority countersigns a
+// subject's Ed25519 public key, binding it to a domain with a set of roles, the roles
+// it may itself issue (grants), and verifiable attributes. Presented at the join
+// handshake (infra/clients) or stored per-address. Valid unless blocked — no mandatory
+// expiry. See the Credential PKI plan.
+message Credential {
+  uint32 version = 1;
+  bytes subject = 2;                  // subject Ed25519 pubkey (== peer ID for infra/clients; identity key for addresses)
+  string domain = 3;
+  string address = 4;                 // role "address" only: local@domain
+  repeated string roles = 5;          // authority|sub-authority|node|bridge|client|address (combine)
+  repeated string grants = 6;         // roles this subject may ISSUE; "grant" = may issue grants-bearing creds
+  map<string, string> attributes = 7; // multiaddr, ip, x25519 (onion key), ...
+  int64 issued_at = 8;                // Unix seconds
+  int64 not_after = 9;                // Unix seconds; 0 = never expires
+  string scope = 10;                  // authority creds: subdomain scope ("" = whole domain)
+  bytes issuer_pub = 11;              // root, or an authority cred (any depth) whose grants cover this
+  bytes signature = 12;               // issuer Ed25519 sig over fields 1-11,13,14 (distinct ctx tag)
+  repeated string relay_hints = 13;   // role "routing" only: the authoritative, operator-signed mailbox relay hints
+  int64 effective_from = 14;          // Unix seconds; not-before (0 = no constraint, effective immediately). Validity window is [effective_from, not_after].
+  // GRAVESTONE: field 15 was rate_steps (a send-rate schedule), removed in the open-core
+  // split. Extension payloads ride the attributes map (7) instead: keys prefixed "ext."
+  // carry base64-std-encoded marshaled extension messages. Attributes are covered by the
+  // signature, so extension payloads are signed without core schema coupling. Do not reuse 15.
+  reserved 15;
+  reserved "rate_steps";
+}
+
+// CredentialBlock is one timestamped, root-signed revocation entry. A block is
+// forward-only by default (creds with issued_at >= effective_from rejected); a
+// compromised key invalidates ALL its signatures.
+message CredentialBlock {
+  bytes pubkey = 1;                   // the blocked key
+  int64 effective_from = 2;           // Unix seconds; creds issued_at >= this are rejected
+  bool compromised = 3;               // true ⇒ invalidate ALL of the key's signatures
+  int64 compromised_since = 4;        // optional best-effort earlier cutoff
+  int64 created_at = 5;               // Unix seconds
+}
+
+// CredentialBlockList is the domain's root-signed blocklist, served as its own
+// record so the DAR doesn't churn on every block.
+message CredentialBlockList {
+  string domain = 1;
+  repeated CredentialBlock blocks = 2;
+  uint64 revision = 3;                // monotonic
+  bytes signature = 4;                // root Ed25519 sig over fields 1-3
+}
+
+// CredentialBundle pairs a Credential with the DAR that anchors it (the unit exchanged at
+// /dmcn/join and provisioning).
+message CredentialBundle {
+  Credential credential = 1;
+  DomainAuthorityRecord dar = 2;
+}
+
+// JoinRequest / JoinResponse carry the /dmcn/join handshake (Credential PKI). Each side
+// presents its Credential plus the DAR that anchors it, so the peer can verify against a
+// direct DNS resolution without a DHT lookup (works at cold-start / for foreign domains). A
+// peer credentialed in SEVERAL domains (hosted multi-tenant) presents one bundle per domain in
+// `bundles`; the singular credential/dar remain for single-domain peers (the primary bundle).
+message JoinRequest {
+  Credential credential = 1;             // primary (single-domain compatibility)
+  DomainAuthorityRecord dar = 2;
+  repeated CredentialBundle bundles = 3; // all of the peer's {credential, DAR}, one per domain
+}
+message JoinResponse {
+  bool accepted = 1;
+  string error = 2;
+  Credential credential = 3; // responder's own primary credential (mutual join)
+  DomainAuthorityRecord dar = 4;
+  repeated CredentialBundle bundles = 5;
+}
+
+// RemovedBinding tombstones a specific prior (address, user key) binding so the
+// address can be re-bound to a new key. See whitepaper Section 13.3.
+message RemovedBinding {
+  bytes ed25519_public_key = 1;  // 32 bytes — the offboarded user identity key
+  int64 removed_at = 2;          // Unix seconds
+}
+
+// AddressRemovalRecord is the root-signed, append-only list of removed bindings
+// for one address, served by the domain's fleet. Only the domain root can
+// publish one, so only root can free an address for re-binding.
+message AddressRemovalRecord {
+  uint32 version = 1;
+  string domain = 2;
+  string address = 3;
+  repeated RemovedBinding removed_bindings = 4;
+  uint64 revision = 5;           // monotonic; bumped on every republish
+  int64 created_at = 6;          // Unix seconds; selects the root key that signed it
+  bytes self_signature = 7;      // 64 bytes Ed25519 by the root key over fields 1-6
+}
+
+// CompromisedKey marks a domain countersigning key (root or sub-authority) as
+// compromised. Countersignatures by this key dated at/after compromised_at are
+// rejected outright; those dated before are honored only until retention_until
+// (a grace window for the domain to re-countersign affected identities with a
+// fresh key), after which the key is fully distrusted — a backdate-proof cutoff,
+// since an attacker holding the key could otherwise forge an earlier date.
+message CompromisedKey {
+  bytes ed25519_public_key = 1;  // 32 bytes — the compromised countersigning key
+  int64 compromised_at = 2;      // Unix seconds — declared compromise time
+  int64 retention_until = 3;     // Unix seconds — pre-compromise sigs honored until this; 0 = immediate full distrust
+}
+
+// RelayDescriptor advertises a relay node's onion-routing key so senders can
+// encrypt onion layers to it. Resolved from the node itself (GetRelayDescriptor)
+// and signed by the node's libp2p identity key — which is recoverable from the
+// peer ID itself, so the descriptor is self-anchoring (no external trust needed
+// to bind the X25519 onion key to the peer). See whitepaper Section 15.4.
+message RelayDescriptor {
+  string peer_id = 1;
+  bytes x25519_public_key = 2;   // 32 bytes — onion layer encryption key
+  repeated string multiaddrs = 3;
+  int64 created_at = 4;          // Unix seconds
+  uint64 revision = 5;           // monotonic; bumped on republish
+  bytes signature = 6;          // node libp2p-key sig over fields 1-5,7 (not the countersig)
+
+  // Domain binding (DMCN PKI / domain-anchored federation). The node self-asserts
+  // the domain it serves (field 7, covered by the self-signature); the domain
+  // authority — root or a PermVouchNode sub-authority — countersigns the stable
+  // {domain, peer_id, x25519} binding (fields 8-10). The countersignature covers
+  // only that binding, NOT multiaddrs/revision, so it survives liveness re-publish.
+  string domain = 7;                        // domain this node belongs to (e.g. "example.com")
+  bytes domain_countersignature = 8;        // 64 bytes Ed25519 over the binding
+  int64 domain_countersigned_at = 9;        // Unix seconds; authenticated countersign time
+  bytes domain_countersigner_pubkey = 10;   // 32 bytes Ed25519 of the root/sub-authority signer
+
+  // credential (Credential PKI): the node's membership credential (role "node"),
+  // so onion route selection can verify a relay's trust by credential without
+  // connecting to it. Replaces the domain_countersignature fields above. Subject is
+  // the peer ID's key, so it can't be swapped onto another descriptor.
+  Credential credential = 11;
+}
+
+// KeyCompromiseRecord is the root-signed, append-only list of compromised
+// countersigning keys for a domain, served by the domain's fleet. Only the
+// domain root can publish one. See whitepaper Section 13 (key compromise).
+message KeyCompromiseRecord {
+  uint32 version = 1;
+  string domain = 2;
+  repeated CompromisedKey compromised_keys = 3;
+  uint64 revision = 4;           // monotonic; bumped on every republish
+  int64 created_at = 5;          // Unix seconds; selects the root key that signed it
+  bytes self_signature = 6;      // 64 bytes Ed25519 by the root key over fields 1-5
+}
