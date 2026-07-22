@@ -1,4 +1,4 @@
-open-dmcn — the DMCN core protocol
+open-dmcn — the DMCN Protocol (DMCNP), core
 Copyright 2026 Merten van Gerven
 
 This product includes software developed as part of the DMCN project
@@ -16,5 +16,6 @@ WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 License for the specific language governing permissions and limitations
 under the License.
 
-The "DMCN" name is a trademark of the DMCN project and is NOT licensed
-under the Apache License — see the Trademarks section of README.md.
+The "DMCN" (the network) and "DMCN Protocol" / "DMCNP" (the protocol) names
+are trademarks of the DMCN project and are NOT licensed under the Apache
+License — see the Trademarks section of README.md.

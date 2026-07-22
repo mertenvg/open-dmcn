@@ -1,7 +1,9 @@
-# The DMCN Core Protocol
+# The DMCN Protocol (DMCNP) — Core
 
-DMCN (Decentralized Mesh Communication Network) is a peer-to-peer, end-to-end-encrypted
-store-and-forward mail network where **cryptographic identity replaces SMTP-style trust**:
+DMCN (the Decentralized Mesh Communication Network) is a peer-to-peer,
+end-to-end-encrypted store-and-forward mail network where **cryptographic identity
+replaces SMTP-style trust**; the DMCN Protocol (DMCNP), specified here, is what its
+participants speak:
 every address is an Ed25519+X25519 keypair whose self-certifying record is served by the
 address's own domain fleet and discovered via DNS ("MX for identity" — no global DHT), and
 mail is hybrid-encrypted client-side and parked in recipient-designated relays' mailboxes.

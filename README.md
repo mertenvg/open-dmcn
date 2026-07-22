@@ -1,8 +1,9 @@
 # open-dmcn
 
-The open core of the **DMCN protocol** — the Decentralized Mesh Communication Network, a
-peer-to-peer, end-to-end-encrypted store-and-forward mail network where **cryptographic
-identity replaces SMTP-style trust**.
+The open core of the **DMCN Protocol (DMCNP)** — the protocol spoken by **DMCN**, the
+Decentralized Mesh Communication Network: a peer-to-peer, end-to-end-encrypted
+store-and-forward mail network where **cryptographic identity replaces SMTP-style
+trust**. DMCN names the network; DMCNP names the protocol specified here.
 
 This repository is the **canonical home of the core protocol schema**: everything an
 independent implementation needs to interoperate — resolve addresses, verify identities,
@@ -59,11 +60,16 @@ authors, and that grant terminates for anyone who initiates patent litigation ov
 
 ## Trademarks
 
-The **"DMCN" name** identifies this protocol and interoperable implementations of it.
-The Apache License covers the code and schema in this repository; it does **not** grant
-rights to the DMCN name or any associated logos. You are free to implement the protocol
-under any name; calling an implementation, service, or fork "DMCN" (or confusingly
-similar) requires that it genuinely interoperate with the protocol specified here, and
-names implying endorsement by or affiliation with the DMCN project require permission.
-This keeps the name meaning what users think it means: an implementation that speaks
-this protocol.
+Two names, two meanings: **"DMCN"** identifies the *network* — the Decentralized Mesh
+Communication Network of interoperating deployments — and **"DMCN Protocol" / "DMCNP"**
+identifies the *protocol* specified in this repository. The Apache License covers the
+code and schema here; it does **not** grant rights to either name or any associated
+logos.
+
+You are free to implement the protocol under any name of your own. Describing an
+implementation or service as speaking the "DMCN Protocol" (or "DMCNP", or confusingly
+similar) requires that it genuinely conform to the protocol specified here; describing
+it as part of "DMCN" additionally means it actually interoperates with the network.
+Names implying endorsement by or affiliation with the DMCN project require permission.
+This keeps both names meaning what users think they mean: DMCNP is the protocol, and
+DMCN is the network of things that truly speak it.
