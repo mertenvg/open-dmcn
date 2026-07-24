@@ -1,0 +1,16 @@
+# Go build output
+/dmcnd
+/bin/
+*.test
+*.out
+coverage*.txt
+
+# Frontend deps + local caches (regenerate with `make build-web` / `npm ci`).
+cmd/dmcnd/web/node_modules/
+
+# The built SPA (cmd/dmcnd/web/dist) is COMMITTED on purpose: `//go:embed web/dist`
+# needs it at `go build` time, so a fresh clone builds the daemon without Node.
+# Regenerate it with `make build-web`.
+
+# OS / editor cruft
+.DS_Store

@@ -1,0 +1,478 @@
+import { useEffect, useState } from 'react';
+import { useNavigate, useOutletContext } from 'react-router-dom';
+import { useAuth } from '../lib/hooks/useAuth';
+import { useKeys } from '../lib/hooks/useKeys';
+import { useIsMobile } from '../lib/useIsMobile';
+import { logout as apiLogout, lookupIdentity } from '../lib/api/client';
+import { toHex, keyPairToPayloadJSON } from '../lib/crypto/keys';
+import { unlockBackupBytes } from '../lib/crypto/reauth';
+import { buildPasswordExport, buildPasskeyExport, triggerDownload, type ExportAuth } from '../lib/crypto/exportFile';
+import { encryptKeys } from '../lib/crypto/keystore';
+import { isPasskeySupported, createPasskeyPRF } from '../lib/crypto/passkey';
+import { makeLocalKeystore, saveLocalKeystore, loadLocalKeystore, type LocalKeystore } from '../lib/crypto/localKeystore';
+import { isStoragePersisted, requestPersistentStorage } from '../lib/crypto/storage';
+import { isStaySignedIn, setStaySignedIn } from '../lib/sessionLifetime';
+import { readTheme, readDensity, type ThemePref } from '../lib/theme';
+import { APP_VERSION } from '../lib/config';
+import { PageShell } from '../components/PageShell';
+import { BlockedSenders } from '../components/BlockedSenders';
+import type { MailOutletContext } from '../components/AppLayout';
+import { useSettings } from '../lib/hooks/useSettings';
+import { useStorageUsage } from '../lib/hooks/useStorageUsage';
+import { Badge, Button, Input, Textarea, Switch, Tabs } from '../ds';
+import { Icon } from '../components/Icon';
+
+type Section = 'profile' | 'privacy' | 'appearance' | 'account';
+
+// formatBytes renders a byte count as a compact human string (e.g. "8.2 MiB").
+// Binary units with binary labels: the storage meter is a METERED surface, which
+// per the settled unit convention reports GiB against the GiB-provisioned ceiling
+// (e.g. "3.8 GiB of 4 GiB") — never the marketed GB, otherwise a user near the
+// cap would read a false over-limit.
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 100 || Number.isInteger(v) ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
+
+// StorageCard surfaces the owner's per-account state usage (Sent, contacts, settings,
+// flags). In the reference client this state lives in the browser's IndexedDB, so there
+// is no relay quota and no billing — the meter just reports the local footprint.
+function StorageCard() {
+  const { usage, loading } = useStorageUsage();
+
+  return (
+    <div style={{ marginBottom: 'var(--space-4)', padding: 'var(--space-4)', border: '1px solid var(--border-default)', background: 'var(--surface-card)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginBottom: 'var(--space-3)' }}>
+        <Icon name="database" size={16} style={{ color: 'var(--brand)' }} />
+        <span style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-strong)' }}>Storage</span>
+      </div>
+      {usage == null ? (
+        <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
+          {loading ? 'Loading usage…' : 'Usage unavailable right now.'}
+        </p>
+      ) : (
+        <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-body)' }}>
+          Using <strong>{formatBytes(usage.usedBytes)}</strong> across {usage.count} item{usage.count === 1 ? '' : 's'}.
+        </p>
+      )}
+      <p style={{ margin: 'var(--space-3) 0 0', fontSize: 'var(--text-sm)', color: 'var(--text-muted)', lineHeight: 'var(--leading-normal)' }}>
+        Covers your sent mail, contacts, settings and message flags — kept in this browser only
+        (this device), never uploaded.
+      </p>
+    </div>
+  );
+}
+
+// Settings row: title + description on the left, control on the right.
+function Row({ title, desc, children }: { title: string; desc?: string; children?: React.ReactNode }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-6)', padding: 'var(--space-4) 0', borderBottom: '1px solid var(--border-subtle)' }}>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-strong)' }}>{title}</div>
+        {desc && <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)', marginTop: 2 }}>{desc}</div>}
+      </div>
+      {children && <div style={{ flex: 'none' }}>{children}</div>}
+    </div>
+  );
+}
+
+// Connected segmented control (theme / density choices).
+function SegOption({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button onClick={onClick} style={{
+      padding: '6px 14px', border: '1px solid var(--border-default)', marginLeft: -1, font: 'inherit', fontSize: 'var(--text-sm)',
+      background: active ? 'var(--brand-subtle)' : 'var(--surface-card)', color: active ? 'var(--brand-text)' : 'var(--text-body)',
+      fontWeight: active ? 600 : 500, cursor: 'pointer',
+    }}>{children}</button>
+  );
+}
+
+export function Settings() {
+  const { address, clearSession } = useAuth();
+  const { keys, clearKeys } = useKeys();
+  const navigate = useNavigate();
+  const embedded = !useIsMobile();
+  // The shell hands down onAppearanceChange so toggling theme/density here re-themes
+  // the whole desktop shell live. (Standalone/mobile uses its own PageShell preview.)
+  const { onAppearanceChange } = useOutletContext<MailOutletContext>();
+
+  const { settings, updateSettings } = useSettings();
+  const [section, setSection] = useState<Section>('profile');
+  // Profile form (synced account settings). Seeded from the loaded settings doc.
+  const [displayName, setDisplayName] = useState('');
+  const [signature, setSignature] = useState('');
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileMsg, setProfileMsg] = useState('');
+  const [fingerprint, setFingerprint] = useState('');
+
+  // Backup & recovery. The encrypted keystore lives only in this browser, so we
+  // offer a user-held export (passphrase- or passkey-protected) as the total-device-
+  // loss safety net, plus a local password change. Both re-unlock via reauth.
+  const [keystore, setKeystore] = useState<LocalKeystore | null>(null);
+  const authMethod = keystore?.authMethod ?? null;
+  const passkeyOk = isPasskeySupported();
+  const [exportMode, setExportMode] = useState<ExportAuth>(passkeyOk ? 'passkey' : 'password');
+  const [exportPw, setExportPw] = useState('');
+  const [exportCurrentPw, setExportCurrentPw] = useState('');
+  const [showExport, setShowExport] = useState(false);
+  const [curPw, setCurPw] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [showChangePw, setShowChangePw] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+  // Whether the browser has exempted this origin from storage eviction. Since the
+  // keystore is the only at-rest copy, a non-persisted origin risks losing it.
+  const [persisted, setPersisted] = useState<boolean | null>(null);
+  const [staySignedIn, setStay] = useState(isStaySignedIn());
+  // Managed-account disclosure (whitepaper §13.8): true when the domain's DAR
+  // declares admin key custody — the org admin holds this account's keys.
+  const [managedDomain, setManagedDomain] = useState(false);
+
+  useEffect(() => {
+    if (!address) return;
+    let cancelled = false;
+    lookupIdentity(address)
+      .then(r => { if (!cancelled) setManagedDomain(!!r.admin_key_custody); })
+      .catch(() => { /* display-only badge; stay hidden on lookup failure */ });
+    return () => { cancelled = true; };
+  }, [address]);
+
+  // Backup download button label. Exporting needs the raw key bytes, which the
+  // non-extractable session handles can't yield, so it re-unlocks the at-rest
+  // keystore first — a passkey account taps their passkey, and a password account
+  // choosing a passkey-protected backup enrolls one. Name that gesture up front so
+  // the WebAuthn prompt isn't a surprise.
+  const backupBtnLabel = busy ? 'Preparing…'
+    : authMethod === 'passkey' ? 'Unlock and download'
+    : exportMode === 'passkey' ? 'Create passkey and download'
+    : 'Download backup';
+
+  useEffect(() => {
+    if (!address) return;
+    loadLocalKeystore(address).then(ks => {
+      setKeystore(ks);
+      // Default the backup protection to match how the account is already secured: a
+      // password account backs up with a passphrase, so exporting never springs a
+      // surprise passkey enrollment. (The user can still switch to a passkey backup.)
+      if (ks?.authMethod === 'password') setExportMode('password');
+      else if (passkeyOk) setExportMode('passkey');
+    });
+  }, [address, passkeyOk]);
+  useEffect(() => { isStoragePersisted().then(setPersisted); }, []);
+
+  const enablePersistence = async () => {
+    setPersisted(await requestPersistentStorage());
+  };
+
+  const exportBackup = async () => {
+    if (!address) return;
+    setBusy(true); setErr(''); setMsg('');
+    try {
+      if (exportMode === 'password' && !exportPw) throw new Error('choose a passphrase for the backup file');
+      // Unlock the raw keys (passkey assertion, or the device password).
+      const res = await unlockBackupBytes(address, authMethod === 'password' ? { password: exportCurrentPw } : undefined);
+
+      let exp;
+      if (exportMode === 'passkey') {
+        // Reuse this device's passkey if it's the unlock method (no second prompt);
+        // otherwise enroll a passkey to protect the backup.
+        if (res.passkey) {
+          exp = await buildPasskeyExport(address, res.kp, res.passkey);
+        } else {
+          const enr = await createPasskeyPRF(address);
+          exp = await buildPasskeyExport(address, res.kp, { credentialId: enr.credentialId, prfSalt: enr.prfSalt, aesKey: enr.aesKey });
+        }
+        setMsg('Backup downloaded. It unlocks with your passkey — on any device where that passkey is available (e.g. via your synced keychain or password manager).');
+      } else {
+        exp = await buildPasswordExport(address, res.kp, exportPw);
+        setMsg('Backup downloaded. Store it somewhere safe — it is encrypted with your chosen passphrase.');
+      }
+      triggerDownload(exp);
+      setShowExport(false); setExportPw(''); setExportCurrentPw('');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'export failed');
+    } finally { setBusy(false); }
+  };
+
+  const changePassword = async () => {
+    if (!address) return;
+    setBusy(true); setErr(''); setMsg('');
+    try {
+      if (!newPw) throw new Error('choose a new password');
+      const { kp: rawKp } = await unlockBackupBytes(address, { password: curPw });
+      const payload = new TextEncoder().encode(keyPairToPayloadJSON(rawKp));
+      const bundle = await encryptKeys(payload, newPw);
+      await saveLocalKeystore(makeLocalKeystore({ address, kp: rawKp, bundle, authMethod: 'password' }));
+      setKeystore(await loadLocalKeystore(address));
+      setMsg('Password changed for this device.');
+      setShowChangePw(false); setCurPw(''); setNewPw('');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'password change failed');
+    } finally { setBusy(false); }
+  };
+  // Appearance prefs live in the same localStorage keys the shell reads.
+  const [themePref, setThemePref] = useState<ThemePref>(() => {
+    const saved = localStorage.getItem('dmcn_theme');
+    return saved === 'light' || saved === 'dark' ? saved : 'system';
+  });
+  const [density, setDensity] = useState<'compact' | 'comfortable'>(() => readDensity());
+
+  // Effective light/dark for the standalone live page preview.
+  const effectiveTheme = themePref === 'system' ? readTheme() : themePref;
+
+  // Write the preference synchronously, then notify the shell to re-read it (so the
+  // raw "system" pref is preserved and the shell re-themes immediately).
+  const applyTheme = (t: ThemePref) => {
+    localStorage.setItem('dmcn_theme', t);
+    setThemePref(t);
+    onAppearanceChange();
+  };
+  const applyDensity = (d: 'compact' | 'comfortable') => {
+    localStorage.setItem('dmcn_density', d);
+    setDensity(d);
+    onAppearanceChange();
+  };
+
+  // Seed the profile form from the synced settings doc when it (re)loads.
+  useEffect(() => {
+    setDisplayName(settings.displayName ?? '');
+    setSignature(settings.signature ?? '');
+  }, [settings.displayName, settings.signature]);
+
+  const saveProfile = async () => {
+    setProfileBusy(true);
+    setProfileMsg('');
+    try {
+      await updateSettings({ displayName: displayName.trim(), signature });
+      setProfileMsg('Saved. Your profile syncs to your other devices.');
+    } catch (e) {
+      setProfileMsg(e instanceof Error ? e.message : 'Failed to save');
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  // Fingerprint: first 20 bytes of SHA-256(Ed25519Public || X25519Public).
+  useEffect(() => {
+    if (!keys) return;
+    const data = new Uint8Array(64);
+    data.set(keys.ed25519Public, 0);
+    data.set(keys.x25519Public, 32);
+    crypto.subtle.digest('SHA-256', data).then(hash => {
+      setFingerprint(toHex(new Uint8Array(hash).slice(0, 20)).toUpperCase());
+    });
+  }, [keys]);
+
+  const grouped = (fingerprint.match(/.{1,4}/g) || []).join('·');
+
+  // Sign out locks this account on this device: it drops the working handles (so the
+  // account re-locks) and ends the session. The encrypted keystore stays, so the
+  // account still appears on the unlock screen. Other tabs/accounts are untouched.
+  const handleSignOut = async () => {
+    try { await apiLogout(); } catch { /* ignore */ }
+    await clearKeys();
+    clearSession();
+    navigate('/login');
+  };
+
+  return (
+    <PageShell embedded={embedded} title="Settings" theme={effectiveTheme} density={density}>
+      <div style={{ maxWidth: 820, margin: '0 auto', padding: 'var(--space-8)' }}>
+        <Tabs
+          value={section}
+          onChange={v => setSection(v as Section)}
+          items={[
+            { value: 'profile', label: 'Profile', icon: <Icon name="user" size={16} /> },
+            { value: 'privacy', label: 'Privacy & security', icon: <Icon name="shield" size={16} /> },
+            { value: 'appearance', label: 'Appearance', icon: <Icon name="sun" size={16} /> },
+            { value: 'account', label: 'Account', icon: <Icon name="user" size={16} /> },
+          ]}
+        />
+
+        {section === 'profile' && (
+          <div style={{ marginTop: 'var(--space-4)' }}>
+            <Row title="Display name" desc="Shown in this app in place of your address. Synced to your other devices; not sent to recipients.">
+              <div style={{ width: 260 }}>
+                <Input value={displayName} onChange={e => setDisplayName(e.target.value)} placeholder={address || 'Your name'} aria-label="Display name" />
+              </div>
+            </Row>
+            <div style={{ padding: 'var(--space-4) 0', borderBottom: '1px solid var(--border-subtle)' }}>
+              <div style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-strong)' }}>Signature</div>
+              <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)', marginTop: 2, marginBottom: 'var(--space-3)' }}>
+                Appended to new messages you compose. Synced across your devices.
+              </div>
+              <Textarea value={signature} onChange={e => setSignature(e.target.value)} rows={4} placeholder="— Sent securely over dmcn" aria-label="Signature" />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', marginTop: 'var(--space-4)' }}>
+              <Button onClick={saveProfile} disabled={profileBusy}>{profileBusy ? 'Saving…' : 'Save profile'}</Button>
+              {profileMsg && <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>{profileMsg}</span>}
+            </div>
+          </div>
+        )}
+
+        {section === 'privacy' && (
+          <div style={{ marginTop: 'var(--space-4)' }}>
+            <div style={{ padding: 'var(--space-4)', border: '1px solid var(--border-default)', background: 'var(--surface-card)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginBottom: 'var(--space-3)' }}>
+                <Icon name="key" size={16} style={{ color: 'var(--brand)' }} />
+                <span style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-strong)' }}>Your encryption key</span>
+                {keys && <Badge variant="success" dot>Active</Badge>}
+              </div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', color: 'var(--text-body)', background: 'var(--surface-sunken)', padding: 'var(--space-3)', letterSpacing: '0.04em', wordBreak: 'break-all' }}>
+                {grouped || 'Computing…'}
+              </div>
+              <p style={{ margin: 'var(--space-3) 0 0', fontSize: 'var(--text-sm)', color: 'var(--text-muted)', lineHeight: 'var(--leading-normal)' }}>
+                Private keys are stored as non-extractable keys in your browser and never leave it. The server holds no
+                copy of your keys — not even encrypted. All encryption and signing happens client-side.
+              </p>
+            </div>
+
+            <div style={{ marginTop: 'var(--space-4)', padding: 'var(--space-4)', border: '1px solid var(--border-default)', background: 'var(--surface-card)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginBottom: 'var(--space-3)' }}>
+                <Icon name="shield-check" size={16} style={{ color: 'var(--brand)' }} />
+                <span style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-strong)' }}>Backup &amp; recovery</span>
+              </div>
+              <p style={{ margin: '0 0 var(--space-3)', fontSize: 'var(--text-sm)', color: 'var(--text-muted)', lineHeight: 'var(--leading-normal)' }}>
+                Because the server keeps no copy of your keys, losing every device means losing this identity. Download an
+                encrypted backup file and keep it somewhere safe — it can restore your identity on a new device.
+              </p>
+
+              {persisted === false && (
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--space-2)', marginBottom: 'var(--space-3)', padding: 'var(--space-3)', background: 'var(--danger-subtle)', color: 'var(--danger)', fontSize: 'var(--text-sm)', borderRadius: 'var(--radius-md)' }}>
+                  <Icon name="alert-triangle" size={15} style={{ marginTop: 1, flex: 'none' }} />
+                  <span>
+                    This browser hasn't granted persistent storage, so it may evict your keys under disk pressure (or, on
+                    Safari, after ~7 days of not opening the app). <strong>Download a backup below.</strong>{' '}
+                    <button type="button" onClick={() => void enablePersistence()} style={{ background: 'none', border: 'none', padding: 0, font: 'inherit', color: 'var(--text-link)', textDecoration: 'underline', cursor: 'pointer' }}>Try enabling persistent storage</button>.
+                  </span>
+                </div>
+              )}
+              {persisted === true && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginBottom: 'var(--space-3)', fontSize: 'var(--text-sm)', color: 'var(--text-muted)' }}>
+                  <Icon name="shield-check" size={15} style={{ color: 'var(--brand)' }} />
+                  Persistent storage is enabled — your keys won't be evicted by the browser.
+                </div>
+              )}
+              {msg && <div style={{ marginBottom: 'var(--space-3)', padding: 'var(--space-3)', background: 'var(--brand-subtle)', color: 'var(--brand-text)', fontSize: 'var(--text-sm)', borderRadius: 'var(--radius-md)' }}>{msg}</div>}
+              {err && <div style={{ marginBottom: 'var(--space-3)', padding: 'var(--space-3)', background: 'var(--danger-subtle)', color: 'var(--danger)', fontSize: 'var(--text-sm)', borderRadius: 'var(--radius-md)' }}>{err}</div>}
+
+              {!showExport ? (
+                <Button size="sm" variant="secondary" onClick={() => { setShowExport(true); setShowChangePw(false); setErr(''); setMsg(''); }}>
+                  Export encrypted backup…
+                </Button>
+              ) : (
+                <form onSubmit={e => { e.preventDefault(); void exportBackup(); }} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)', marginBottom: 'var(--space-3)' }}>
+                  {passkeyOk && (
+                    <div>
+                      <label style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--weight-medium)', color: 'var(--text-body)', display: 'block', marginBottom: 'var(--space-2)' }}>Protect the backup with</label>
+                      <div style={{ display: 'flex' }}>
+                        <SegOption active={exportMode === 'passkey'} onClick={() => setExportMode('passkey')}>Passkey</SegOption>
+                        <SegOption active={exportMode === 'password'} onClick={() => setExportMode('password')}>Passphrase</SegOption>
+                      </div>
+                    </div>
+                  )}
+                  {authMethod === 'password' && (
+                    <Input label="Current device password" type="password" value={exportCurrentPw} onChange={e => setExportCurrentPw(e.target.value)} />
+                  )}
+                  {exportMode === 'password' ? (
+                    <Input label="Backup passphrase" type="password" value={exportPw} onChange={e => setExportPw(e.target.value)} hint="Encrypts the backup file. You'll need it to restore." autoFocus />
+                  ) : (
+                    <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-muted)', lineHeight: 'var(--leading-normal)' }}>
+                      The backup unlocks with your passkey. It will open on any device where that passkey is available —
+                      with a synced passkey (iCloud Keychain, Google Password Manager, a password manager) that's all your
+                      devices; with a device-bound security key, only that key. Keep a passphrase backup too if you're unsure.
+                    </p>
+                  )}
+                  <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                    <Button size="sm" type="submit" disabled={busy}>{backupBtnLabel}</Button>
+                    <Button size="sm" variant="secondary" type="button" disabled={busy} onClick={() => { setShowExport(false); setExportPw(''); setExportCurrentPw(''); }}>Cancel</Button>
+                  </div>
+                </form>
+              )}
+
+              {authMethod === 'password' && (
+                <div style={{ marginTop: 'var(--space-3)' }}>
+                  {!showChangePw ? (
+                    <Button size="sm" variant="secondary" onClick={() => { setShowChangePw(true); setShowExport(false); setErr(''); setMsg(''); }}>
+                      Change device password…
+                    </Button>
+                  ) : (
+                    <form onSubmit={e => { e.preventDefault(); void changePassword(); }} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+                      <Input label="Current password" type="password" value={curPw} onChange={e => setCurPw(e.target.value)} autoFocus />
+                      <Input label="New password" type="password" value={newPw} onChange={e => setNewPw(e.target.value)} />
+                      <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                        <Button size="sm" type="submit" disabled={busy}>{busy ? 'Updating…' : 'Change password'}</Button>
+                        <Button size="sm" variant="secondary" type="button" disabled={busy} onClick={() => { setShowChangePw(false); setCurPw(''); setNewPw(''); }}>Cancel</Button>
+                      </div>
+                    </form>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 'var(--space-4)', padding: 'var(--space-4)', border: '1px solid var(--border-default)', background: 'var(--surface-card)', display: 'flex', alignItems: 'center', gap: 'var(--space-4)' }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 'var(--text-md)', fontWeight: 600, color: 'var(--text-strong)' }}>Stay signed in after closing the browser</div>
+                <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)', marginTop: 2, lineHeight: 'var(--leading-normal)' }}>
+                  Off (recommended): each tab unlocks on its own and locks when closed, so reopening needs your passkey or
+                  password — a page refresh never re-prompts. On: accounts stay unlocked across browser restarts for
+                  one-click access.
+                </div>
+              </div>
+              <Switch checked={staySignedIn} onChange={v => { setStaySignedIn(v); setStay(v); }} />
+            </div>
+
+            {keys && <BlockedSenders keys={keys} />}
+          </div>
+        )}
+
+        {section === 'appearance' && (
+          <div style={{ marginTop: 'var(--space-4)' }}>
+            <Row title="Theme" desc="Light, dark, or follow your system setting.">
+              <div style={{ display: 'flex' }}>
+                <SegOption active={themePref === 'light'} onClick={() => applyTheme('light')}>Light</SegOption>
+                <SegOption active={themePref === 'dark'} onClick={() => applyTheme('dark')}>Dark</SegOption>
+                <SegOption active={themePref === 'system'} onClick={() => applyTheme('system')}>System</SegOption>
+              </div>
+            </Row>
+            <Row title="Density" desc="Comfortable spacing, or compact to fit more messages per screen.">
+              <div style={{ display: 'flex' }}>
+                <SegOption active={density === 'comfortable'} onClick={() => applyDensity('comfortable')}>Comfortable</SegOption>
+                <SegOption active={density === 'compact'} onClick={() => applyDensity('compact')}>Compact</SegOption>
+              </div>
+            </Row>
+          </div>
+        )}
+
+        {section === 'account' && (
+          <div style={{ marginTop: 'var(--space-4)' }}>
+            <StorageCard />
+            <Row title="Signed in as">
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', color: 'var(--text-body)' }}>{address}</span>
+            </Row>
+            {managedDomain && (
+              <Row title="Managed account" desc="Keys for this account are held by your domain administrator. Account recovery and new devices are set up through them (device pairing).">
+                <Badge variant="neutral"><Icon name="shield-check" size={13} /> Managed</Badge>
+              </Row>
+            )}
+            <Row title="Switch or add account" desc="Use another identity (work, personal) in this tab, or add a new one.">
+              <Button variant="secondary" size="sm" leftIcon={<Icon name="users" size={15} />} onClick={() => navigate('/login')}>Switch account</Button>
+            </Row>
+            <Row title="Sign out" desc="Locks this account on this device and ends the session. It stays available to unlock again.">
+              <Button variant="danger" size="sm" leftIcon={<Icon name="log-out" size={15} />} onClick={handleSignOut}>Sign out</Button>
+            </Row>
+          </div>
+        )}
+
+        <div style={{ marginTop: 'var(--space-6)', fontSize: 'var(--text-xs)', color: 'var(--text-subtle)' }}>
+          DMCN Mail <span style={{ fontFamily: 'var(--font-mono)' }}>{APP_VERSION}</span>
+        </div>
+      </div>
+    </PageShell>
+  );
+}

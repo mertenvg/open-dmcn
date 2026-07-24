@@ -1,0 +1,66 @@
+// Minimal IndexedDB wrapper (no dependency). One database with three object stores:
+//   - 'working'  — the unlocked, non-extractable CryptoKey handles (session-scoped)
+//   - 'keystore' — the client-side encrypted blob + unlock metadata (persistent)
+//   - 'personal' — the account's per-account mail state (Sent, read/unread + labels,
+//                  contacts, settings, block/allow list). In the DMCN reference client
+//                  this lives ONLY in the browser (the product syncs it to the relay via
+//                  the mailbox-ext personal-KV ops, which the open protocol does not carry).
+//
+// We store structured-cloneable values directly (CryptoKey objects survive the
+// clone with their bytes never serialized into JS reach). Keys are simple strings.
+
+const DB_NAME = 'dmcn';
+const DB_VERSION = 2;
+export const WORKING_STORE = 'working';
+export const KEYSTORE_STORE = 'keystore';
+export const PERSONAL_STORE = 'personal';
+
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+function openDB(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(WORKING_STORE)) db.createObjectStore(WORKING_STORE);
+      if (!db.objectStoreNames.contains(KEYSTORE_STORE)) db.createObjectStore(KEYSTORE_STORE);
+      if (!db.objectStoreNames.contains(PERSONAL_STORE)) db.createObjectStore(PERSONAL_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return dbPromise;
+}
+
+function tx<T>(store: string, mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
+  return openDB().then(
+    db =>
+      new Promise<T>((resolve, reject) => {
+        const t = db.transaction(store, mode);
+        const req = fn(t.objectStore(store));
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      })
+  );
+}
+
+export function idbGet<T>(store: string, key: string): Promise<T | undefined> {
+  return tx<T | undefined>(store, 'readonly', s => s.get(key) as IDBRequest<T | undefined>);
+}
+
+export function idbGetAll<T>(store: string): Promise<T[]> {
+  return tx<T[]>(store, 'readonly', s => s.getAll() as IDBRequest<T[]>);
+}
+
+export function idbGetAllKeys(store: string): Promise<string[]> {
+  return tx<string[]>(store, 'readonly', s => s.getAllKeys() as unknown as IDBRequest<string[]>);
+}
+
+export function idbPut(store: string, key: string, value: unknown): Promise<void> {
+  return tx(store, 'readwrite', s => s.put(value, key)).then(() => undefined);
+}
+
+export function idbDelete(store: string, key: string): Promise<void> {
+  return tx(store, 'readwrite', s => s.delete(key)).then(() => undefined);
+}

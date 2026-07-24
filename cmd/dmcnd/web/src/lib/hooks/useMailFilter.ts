@@ -1,0 +1,101 @@
+import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode, createElement } from 'react';
+import { MailFilterClient, emptyFilterList, type FilterList } from '../api/filterRest';
+import { useKeys } from './useKeys';
+import { useAuth } from './useAuth';
+
+interface MailFilterContextValue {
+  filter: FilterList | null;
+  // ready is false until the first load resolves, so consumers don't act on a
+  // not-yet-loaded (null) list.
+  ready: boolean;
+  blockSender: (senderAddress: string, senderKeyHex?: string) => Promise<void>;
+}
+
+const MailFilterContext = createContext<MailFilterContextValue | null>(null);
+
+// MailFilterProvider loads the recipient's block/allow policy (the personal
+// blocklist, §14.3) ONCE for the whole app and exposes it plus a key-bound block
+// action. Sharing one instance (rather than a fresh per-consumer hook) is what keeps
+// the reader from re-loading — and flickering — on every open.
+export function MailFilterProvider({ children }: { children: ReactNode }) {
+  const { keys } = useKeys();
+  const { sessionToken, isAuthenticated } = useAuth();
+  const [filter, setFilter] = useState<FilterList | null>(null);
+  const [ready, setReady] = useState(false);
+  const clientRef = useRef<MailFilterClient | null>(null);
+  const sigRef = useRef('');
+
+  // Gate on the account session, not just keys — same pairing race as
+  // ContactsProvider: the blocklist must load against the real account token, not
+  // the ephemeral pairing token that's live for a beat after keys are installed.
+  useEffect(() => {
+    if (!keys || !sessionToken || !isAuthenticated) return;
+    const client = new MailFilterClient(keys);
+    clientRef.current = client;
+    let cancelled = false;
+    const load = () => client.get()
+      .then(f => {
+        if (cancelled) return;
+        // Only replace on an actual change, so a wake-reload of an unchanged list
+        // doesn't churn `filter` identity and re-render consumers.
+        const sig = JSON.stringify(f);
+        if (sig !== sigRef.current) { sigRef.current = sig; setFilter(f); }
+      })
+      .catch(() => { /* transient */ })
+      .finally(() => { if (!cancelled) setReady(true); });
+    load();
+    // Refresh on wake so a block/allow edit made in Settings (a separate client)
+    // reflects here without a full remount.
+    const onWake = () => { if (document.visibilityState === 'visible' && navigator.onLine) load(); };
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('online', onWake);
+    window.addEventListener('focus', onWake);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('online', onWake);
+      window.removeEventListener('focus', onWake);
+      clientRef.current = null;
+      setReady(false);
+      setFilter(null);
+    };
+  }, [keys, sessionToken, isAuthenticated]);
+
+  // blockSender adds the sender's key to the unconditional key-bound blocklist
+  // (§14.3.1) — so the block survives an address change. In deny mode we also list
+  // the address for a human-readable entry; in allow mode we don't (adding to
+  // `senders` there would ADMIT them). Re-reads the current list first so a stale
+  // in-memory copy can't clobber concurrent edits.
+  const blockSender = useCallback(async (senderAddress: string, senderKeyHex?: string) => {
+    const client = clientRef.current;
+    if (!client) return;
+    const cur = (await client.get()) ?? emptyFilterList();
+    const next: FilterList = {
+      mode: cur.mode || 'deny',
+      domains: [...(cur.domains ?? [])],
+      senders: [...(cur.senders ?? [])],
+      allow_verified: cur.allow_verified,
+      sender_keys: [...(cur.sender_keys ?? [])],
+    };
+    if (senderKeyHex) {
+      const k = senderKeyHex.toLowerCase();
+      if (!next.sender_keys!.some(x => x.toLowerCase() === k)) next.sender_keys!.push(k);
+    }
+    if (next.mode === 'deny') {
+      const a = senderAddress.trim().toLowerCase();
+      if (!next.senders.some(x => x.trim().toLowerCase() === a)) next.senders.push(a);
+    }
+    await client.save(next);
+    sigRef.current = JSON.stringify(next);
+    setFilter(next);
+  }, []);
+
+  const value: MailFilterContextValue = { filter, ready, blockSender };
+  return createElement(MailFilterContext.Provider, { value }, children);
+}
+
+export function useMailFilter(): MailFilterContextValue {
+  const ctx = useContext(MailFilterContext);
+  if (!ctx) throw new Error('useMailFilter must be used within MailFilterProvider');
+  return ctx;
+}
